@@ -29,10 +29,10 @@ const (
 	s3TLSHandshakeTimeout = 30 * time.Second
 	s3DeleteTimeout       = 30 * time.Second
 
-	// Chunk size for multipart uploads - 16MB provides good balance between
-	// memory usage and upload efficiency. This creates backpressure to pg_dump
-	// by only reading one chunk at a time and waiting for S3 to confirm receipt.
-	multipartChunkSize = 16 * 1024 * 1024
+	maxParts               = 1000
+	MinPartSize      int64 = 5 * 1024 * 1024          // 5 MB — S3 minimum part size
+	MaxPartSize      int64 = 5 * 1024 * 1024 * 1024   // 5 GB — S3 maximum part size
+	DefaultPartSize  int64 = 32 * 1024 * 1024         // 32 MB — safe default for streaming (unknown size), supports up to ~32 GB
 )
 
 type S3Storage struct {
@@ -47,10 +47,47 @@ type S3Storage struct {
 	S3UseVirtualHostedStyle bool           `json:"s3UseVirtualHostedStyle" gorm:"default:false;column:s3_use_virtual_hosted_style"`
 	SkipTLSVerify           bool           `json:"skipTLSVerify"           gorm:"default:false;column:skip_tls_verify"`
 	S3StorageClass          S3StorageClass `json:"s3StorageClass"          gorm:"type:text;column:s3_storage_class;default:''"`
+	S3PartSize              int64          `json:"s3PartSize"              gorm:"column:s3_part_size;default:0"`
 }
 
 func (s *S3Storage) TableName() string {
 	return "s3_storages"
+}
+
+// CalculatePartSize returns the optimal multipart chunk size for a given file size,
+func CalculatePartSize(fileSize int64) int64 {
+	if fileSize <= 0 {
+		return DefaultPartSize
+	}
+
+	partSize := (fileSize + maxParts - 1) / maxParts
+
+	if partSize < MinPartSize {
+		return MinPartSize
+	}
+
+	if partSize > MaxPartSize {
+		return MaxPartSize
+	}
+
+	return partSize
+}
+
+// getPartSize returns the chunk size to use for multipart uploads.
+func (s *S3Storage) getPartSize() int64 {
+	if s.S3PartSize > 0 {
+		if s.S3PartSize < MinPartSize {
+			return MinPartSize
+		}
+
+		if s.S3PartSize > MaxPartSize {
+			return MaxPartSize
+		}
+
+		return s.S3PartSize
+	}
+
+	return DefaultPartSize
 }
 
 func (s *S3Storage) SaveFile(
@@ -85,7 +122,8 @@ func (s *S3Storage) SaveFile(
 
 	var parts []minio.CompletePart
 	partNumber := 1
-	buf := make([]byte, multipartChunkSize)
+	chunkSize := s.getPartSize()
+	buf := make([]byte, chunkSize)
 
 	for {
 		select {
@@ -353,6 +391,7 @@ func (s *S3Storage) Update(incoming *S3Storage) {
 	s.S3UseVirtualHostedStyle = incoming.S3UseVirtualHostedStyle
 	s.SkipTLSVerify = incoming.SkipTLSVerify
 	s.S3StorageClass = incoming.S3StorageClass
+	s.S3PartSize = incoming.S3PartSize
 
 	if incoming.S3AccessKey != "" {
 		s.S3AccessKey = incoming.S3AccessKey
