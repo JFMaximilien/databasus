@@ -391,7 +391,7 @@ func createPostgresqlSSLDatabaseViaAPI(
 			Username: username,
 			Password: password,
 			Database: &database,
-			IsHttps:  true,
+			SslMode:  pgtypes.PostgresSslModeRequire,
 			CpuCount: 1,
 		},
 	}
@@ -414,7 +414,7 @@ func createPostgresqlSSLRestoreViaAPI(
 			Username: username,
 			Password: password,
 			Database: &database,
-			IsHttps:  true,
+			SslMode:  pgtypes.PostgresSslModeRequire,
 			CpuCount: 1,
 		},
 	}

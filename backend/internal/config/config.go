@@ -109,10 +109,11 @@ type EnvVariables struct {
 	TestMongodb70Port string `env:"TEST_MONGODB_70_PORT"`
 	TestMongodb82Port string `env:"TEST_MONGODB_82_PORT"`
 
-	TestPostgresSslPort string `env:"TEST_POSTGRES_SSL_PORT"`
-	TestMariadbSslPort  string `env:"TEST_MARIADB_SSL_PORT"`
-	TestMysqlSslPort    string `env:"TEST_MYSQL_SSL_PORT"`
-	TestMongodbSslPort  string `env:"TEST_MONGODB_SSL_PORT"`
+	TestPostgresSslPort  string `env:"TEST_POSTGRES_SSL_PORT"`
+	TestPostgresMtlsPort string `env:"TEST_POSTGRES_MTLS_PORT"`
+	TestMariadbSslPort   string `env:"TEST_MARIADB_SSL_PORT"`
+	TestMysqlSslPort     string `env:"TEST_MYSQL_SSL_PORT"`
+	TestMongodbSslPort   string `env:"TEST_MONGODB_SSL_PORT"`
 
 	// oauth
 	GitHubClientID     string `env:"GITHUB_CLIENT_ID"`

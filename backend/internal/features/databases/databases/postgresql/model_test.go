@@ -72,7 +72,7 @@ func Test_TestConnection_PasswordContainingSpaces_TestedSuccessfully(t *testing.
 		Username: usernameWithSpaces,
 		Password: passwordWithSpaces,
 		Database: &container.Database,
-		IsHttps:  false,
+		SslMode:  PostgresSslModeDisable,
 		CpuCount: 1,
 	}
 
@@ -142,7 +142,7 @@ func Test_TestConnection_InsufficientPermissions_ReturnsError(t *testing.T) {
 				Username: limitedUsername,
 				Password: limitedPassword,
 				Database: &container.Database,
-				IsHttps:  false,
+				SslMode:  PostgresSslModeDisable,
 				CpuCount: 1,
 			}
 
@@ -229,7 +229,7 @@ func Test_TestConnection_SufficientPermissions_Success(t *testing.T) {
 				Username: backupUsername,
 				Password: backupPassword,
 				Database: &container.Database,
-				IsHttps:  false,
+				SslMode:  PostgresSslModeDisable,
 				CpuCount: 1,
 			}
 
@@ -304,7 +304,7 @@ func Test_IsUserReadOnly_ReadOnlyUser_ReturnsTrue(t *testing.T) {
 		Username: username,
 		Password: password,
 		Database: pgModel.Database,
-		IsHttps:  false,
+		SslMode:  PostgresSslModeDisable,
 		CpuCount: 1,
 	}
 
@@ -372,7 +372,7 @@ func Test_CreateReadOnlyUser_UserCanReadButNotWrite(t *testing.T) {
 				Username: username,
 				Password: password,
 				Database: pgModel.Database,
-				IsHttps:  false,
+				SslMode:  PostgresSslModeDisable,
 			}
 
 			isReadOnly, privileges, err := readOnlyModel.IsUserReadOnly(
@@ -559,7 +559,7 @@ func Test_CreateReadOnlyUser_DatabaseNameWithDash_Success(t *testing.T) {
 		Username: container.Username,
 		Password: container.Password,
 		Database: &dashDbName,
-		IsHttps:  false,
+		SslMode:  PostgresSslModeDisable,
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -644,7 +644,7 @@ func Test_CreateReadOnlyUser_WithPublicSchema_Success(t *testing.T) {
 				Username: username,
 				Password: password,
 				Database: pgModel.Database,
-				IsHttps:  false,
+				SslMode:  PostgresSslModeDisable,
 			}
 
 			isReadOnly, privileges, err := readOnlyModel.IsUserReadOnly(
@@ -751,7 +751,7 @@ func Test_CreateReadOnlyUser_WithoutPublicSchema_Success(t *testing.T) {
 				Username: username,
 				Password: password,
 				Database: pgModel.Database,
-				IsHttps:  false,
+				SslMode:  PostgresSslModeDisable,
 			}
 
 			isReadOnly, privileges, err := readOnlyModel.IsUserReadOnly(
@@ -898,7 +898,7 @@ func Test_CreateReadOnlyUser_PublicSchemaExistsButNoPermissions_ReturnsError(t *
 				Username: limitedAdminUsername,
 				Password: limitedAdminPassword,
 				Database: &container.Database,
-				IsHttps:  false,
+				SslMode:  PostgresSslModeDisable,
 			}
 
 			logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
@@ -1606,6 +1606,246 @@ func Test_GetRawDbSizeMb_Postgresql_ReturnsPositiveSize(t *testing.T) {
 	assert.Greater(t, sizeMB, 0.0, "raw db size should be > 0 after inserting data")
 }
 
+func Test_HideSensitiveData_WhenCalled_ClearsPasswordAndPreservesOtherFields(t *testing.T) {
+	databaseName := "appdb"
+	pgModel := &PostgresqlDatabase{
+		Version:        tools.GetPostgresqlVersionEnum("16"),
+		BackupType:     PostgresBackupTypePgDump,
+		Host:           "db.example.com",
+		Port:           5432,
+		Username:       "appuser",
+		Password:       "supersecret",
+		Database:       &databaseName,
+		SslMode:        PostgresSslModeRequire,
+		IncludeSchemas: []string{"public"},
+		ExcludeTables:  []string{"audit_logs"},
+		CpuCount:       4,
+	}
+
+	pgModel.HideSensitiveData()
+
+	assert.Empty(t, pgModel.Password)
+	assert.Equal(t, "db.example.com", pgModel.Host)
+	assert.Equal(t, 5432, pgModel.Port)
+	assert.Equal(t, "appuser", pgModel.Username)
+	assert.Equal(t, &databaseName, pgModel.Database)
+	assert.Equal(t, PostgresSslModeRequire, pgModel.SslMode)
+	assert.Equal(t, PostgresBackupTypePgDump, pgModel.BackupType)
+	assert.Equal(t, []string{"public"}, pgModel.IncludeSchemas)
+	assert.Equal(t, []string{"audit_logs"}, pgModel.ExcludeTables)
+	assert.Equal(t, 4, pgModel.CpuCount)
+}
+
+func Test_HideSensitiveData_WhenReceiverIsNil_DoesNotPanic(t *testing.T) {
+	var pgModel *PostgresqlDatabase
+
+	assert.NotPanics(t, func() {
+		pgModel.HideSensitiveData()
+	})
+}
+
+type stubEncryptor struct{}
+
+func (stubEncryptor) Encrypt(value string) (string, error) {
+	if value == "" || strings.HasPrefix(value, "enc:") {
+		return value, nil
+	}
+
+	return "enc:" + value, nil
+}
+
+func (stubEncryptor) Decrypt(value string) (string, error) {
+	return strings.TrimPrefix(value, "enc:"), nil
+}
+
+func Test_HideSensitiveData_WhenCertsSet_ClearsOnlyClientKey(t *testing.T) {
+	databaseName := "appdb"
+	pgModel := &PostgresqlDatabase{
+		Host:          "db.example.com",
+		Port:          5432,
+		Username:      "appuser",
+		Password:      "supersecret",
+		Database:      &databaseName,
+		SslMode:       PostgresSslModeVerifyFull,
+		SslClientCert: "client-cert-pem",
+		SslClientKey:  "client-key-pem",
+		SslRootCert:   "root-cert-pem",
+		CpuCount:      1,
+	}
+
+	pgModel.HideSensitiveData()
+
+	assert.Empty(t, pgModel.Password)
+	assert.Empty(t, pgModel.SslClientKey)
+	assert.Equal(t, "client-cert-pem", pgModel.SslClientCert)
+	assert.Equal(t, "root-cert-pem", pgModel.SslRootCert)
+	assert.Equal(t, PostgresSslModeVerifyFull, pgModel.SslMode)
+}
+
+func Test_EncryptSensitiveFields_WhenCertsSet_EncryptsEverySecret(t *testing.T) {
+	pgModel := &PostgresqlDatabase{
+		Password:      "supersecret",
+		SslMode:       PostgresSslModeVerifyFull,
+		SslClientCert: "client-cert-pem",
+		SslClientKey:  "client-key-pem",
+		SslRootCert:   "root-cert-pem",
+	}
+
+	err := pgModel.EncryptSensitiveFields(stubEncryptor{})
+	assert.NoError(t, err)
+	assert.Equal(t, "enc:supersecret", pgModel.Password)
+	assert.Equal(t, "enc:client-cert-pem", pgModel.SslClientCert)
+	assert.Equal(t, "enc:client-key-pem", pgModel.SslClientKey)
+	assert.Equal(t, "enc:root-cert-pem", pgModel.SslRootCert)
+
+	err = pgModel.EncryptSensitiveFields(stubEncryptor{})
+	assert.NoError(t, err)
+	assert.Equal(t, "enc:supersecret", pgModel.Password)
+	assert.Equal(t, "enc:client-key-pem", pgModel.SslClientKey)
+}
+
+func Test_EncryptSensitiveFields_WhenCertsEmpty_LeavesThemEmpty(t *testing.T) {
+	pgModel := &PostgresqlDatabase{Password: "supersecret"}
+
+	err := pgModel.EncryptSensitiveFields(stubEncryptor{})
+	assert.NoError(t, err)
+	assert.Equal(t, "enc:supersecret", pgModel.Password)
+	assert.Empty(t, pgModel.SslClientCert)
+	assert.Empty(t, pgModel.SslClientKey)
+	assert.Empty(t, pgModel.SslRootCert)
+}
+
+func Test_Update_WhenIncomingClientKeyEmpty_PreservesExistingKey(t *testing.T) {
+	databaseName := "appdb"
+	existing := &PostgresqlDatabase{
+		Host:          "old-host",
+		Port:          5432,
+		Username:      "olduser",
+		Password:      "enc:oldpass",
+		Database:      &databaseName,
+		SslMode:       PostgresSslModeVerifyCA,
+		SslClientCert: "enc:old-cert",
+		SslClientKey:  "enc:old-key",
+		SslRootCert:   "enc:old-root",
+		CpuCount:      1,
+	}
+
+	incoming := &PostgresqlDatabase{
+		Host:          "new-host",
+		Port:          5433,
+		Username:      "newuser",
+		Database:      &databaseName,
+		SslMode:       PostgresSslModeRequire,
+		SslClientCert: "new-cert",
+		SslClientKey:  "",
+		SslRootCert:   "new-root",
+		CpuCount:      2,
+	}
+
+	existing.Update(incoming)
+
+	assert.Equal(t, PostgresSslModeRequire, existing.SslMode)
+	assert.Equal(t, "new-cert", existing.SslClientCert)
+	assert.Equal(t, "enc:old-key", existing.SslClientKey)
+	assert.Equal(t, "new-root", existing.SslRootCert)
+}
+
+func Test_Validate_SslConfig_EnforcesCertRules(t *testing.T) {
+	databaseName := "appdb"
+	baseModel := func() *PostgresqlDatabase {
+		return &PostgresqlDatabase{
+			Host:     "db.example.com",
+			Port:     5432,
+			Username: "appuser",
+			Password: "secret",
+			Database: &databaseName,
+			CpuCount: 1,
+		}
+	}
+
+	testCases := []struct {
+		name          string
+		mutate        func(*PostgresqlDatabase)
+		expectedError string
+	}{
+		{
+			name: "client cert without key",
+			mutate: func(p *PostgresqlDatabase) {
+				p.SslMode = PostgresSslModeRequire
+				p.SslClientCert = "cert"
+			},
+			expectedError: "client certificate and client key must be provided together",
+		},
+		{
+			name: "client key without cert",
+			mutate: func(p *PostgresqlDatabase) {
+				p.SslMode = PostgresSslModeRequire
+				p.SslClientKey = "key"
+			},
+			expectedError: "client certificate and client key must be provided together",
+		},
+		{
+			name: "certificates with SSL disabled",
+			mutate: func(p *PostgresqlDatabase) {
+				p.SslMode = PostgresSslModeDisable
+				p.SslClientCert = "cert"
+				p.SslClientKey = "key"
+			},
+			expectedError: "SSL certificates require SSL to be enabled",
+		},
+		{
+			name: "unknown SSL mode",
+			mutate: func(p *PostgresqlDatabase) {
+				p.SslMode = "bogus"
+			},
+			expectedError: "invalid SSL mode",
+		},
+		{
+			name: "client certificate pair with verify-full",
+			mutate: func(p *PostgresqlDatabase) {
+				p.SslMode = PostgresSslModeVerifyFull
+				p.SslClientCert = "cert"
+				p.SslClientKey = "key"
+				p.SslRootCert = "root"
+			},
+			expectedError: "",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			model := baseModel()
+			tc.mutate(model)
+
+			err := model.Validate()
+
+			if tc.expectedError == "" {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+				assert.Contains(t, err.Error(), tc.expectedError)
+			}
+		})
+	}
+}
+
+func Test_Validate_WhenSslModeEmpty_DefaultsToDisable(t *testing.T) {
+	databaseName := "appdb"
+	model := &PostgresqlDatabase{
+		Host:     "db.example.com",
+		Port:     5432,
+		Username: "appuser",
+		Password: "secret",
+		Database: &databaseName,
+		CpuCount: 1,
+	}
+
+	err := model.Validate()
+
+	assert.NoError(t, err)
+	assert.Equal(t, PostgresSslModeDisable, model.SslMode)
+}
+
 func connectToPostgresContainer(t *testing.T, port string) *PostgresContainer {
 	dbName := "testdb"
 	password := "testpassword"
@@ -1651,7 +1891,7 @@ func createPostgresModel(container *PostgresContainer) *PostgresqlDatabase {
 		Username: container.Username,
 		Password: container.Password,
 		Database: &container.Database,
-		IsHttps:  false,
+		SslMode:  PostgresSslModeDisable,
 		CpuCount: 1,
 	}
 }

@@ -1,4 +1,5 @@
 import type { PostgresBackupType } from './PostgresBackupType';
+import type { PostgresSslMode } from './PostgresSslMode';
 import type { PostgresqlVersion } from './PostgresqlVersion';
 
 export interface PostgresqlDatabase {
@@ -12,7 +13,12 @@ export interface PostgresqlDatabase {
   username: string;
   password: string;
   database?: string;
-  isHttps: boolean;
+
+  // SSL / TLS
+  sslMode: PostgresSslMode;
+  sslClientCert?: string;
+  sslClientKey?: string;
+  sslRootCert?: string;
 
   // backup settings
   includeSchemas?: string[];

@@ -127,13 +127,15 @@ func (r *RcloneStorage) DeleteFile(encryptor encryption.FieldEncryptor, fileName
 	filePath := r.getFilePath(fileName)
 
 	obj, err := remoteFs.NewObject(ctx, filePath)
-	if err != nil {
+	if errors.Is(err, fs.ErrorObjectNotFound) {
 		return nil
 	}
-
-	err = obj.Remove(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to delete file from rclone: %w", err)
+		return fmt.Errorf("failed to look up file in rclone: %w", err)
+	}
+
+	if err := operations.DeleteFile(ctx, obj); err != nil {
+		return fmt.Errorf("failed to delete file via rclone: %w", err)
 	}
 
 	return nil

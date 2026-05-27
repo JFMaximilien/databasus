@@ -46,6 +46,9 @@ import (
 	users_controllers "databasus-backend/internal/features/users/controllers"
 	users_middleware "databasus-backend/internal/features/users/middleware"
 	users_services "databasus-backend/internal/features/users/services"
+	verification_agents "databasus-backend/internal/features/verification/agents"
+	verification_config "databasus-backend/internal/features/verification/config"
+	verification_runs "databasus-backend/internal/features/verification/runs"
 	workspaces_controllers "databasus-backend/internal/features/workspaces/controllers"
 	cache_utils "databasus-backend/internal/util/cache"
 	env_utils "databasus-backend/internal/util/env"
@@ -213,6 +216,8 @@ func startServerWithGracefulShutdown(log *slog.Logger, app *gin.Engine) {
 func setUpRoutes(r *gin.Engine) {
 	v1 := r.Group("/api/v1")
 
+	v1.Use(noStoreCacheControl())
+
 	// Mount Swagger UI
 	v1.GET("/docs/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
 
@@ -225,6 +230,8 @@ func setUpRoutes(r *gin.Engine) {
 	backups_controllers.GetBackupController().RegisterPublicRoutes(v1)
 	backups_controllers.GetPostgresWalBackupController().RegisterRoutes(v1)
 	databases.GetDatabaseController().RegisterPublicRoutes(v1)
+	verification_agents.GetAgentFacingController().RegisterRoutes(v1)
+	verification_runs.GetVerificationAgentController().RegisterRoutes(v1)
 
 	if config.GetEnv().IsCloud {
 		billing_paddle.GetPaddleBillingController().RegisterPublicRoutes(v1)
@@ -254,6 +261,9 @@ func setUpRoutes(r *gin.Engine) {
 	users_controllers.GetManagementController().RegisterRoutes(protected)
 	users_controllers.GetSettingsController().RegisterRoutes(protected)
 	billing.GetBillingController().RegisterRoutes(protected)
+	verification_agents.GetAgentController().RegisterRoutes(protected)
+	verification_config.GetVerificationConfigController().RegisterRoutes(protected)
+	verification_runs.GetVerificationController().RegisterRoutes(protected)
 }
 
 func setUpDependencies() {
@@ -265,6 +275,8 @@ func setUpDependencies() {
 	notifiers.SetupDependencies()
 	storages.SetupDependencies()
 	backups_config.SetupDependencies()
+	verification_config.SetupDependencies()
+	verification_runs.SetupDependencies()
 	task_cancellation.SetupDependencies()
 	billing.SetupDependencies()
 
@@ -315,6 +327,10 @@ func runBackgroundTasks(log *slog.Logger) {
 
 		go runWithPanicLogging(log, "backup background service", func() {
 			backuping.GetBackupsScheduler().Run(ctx)
+		})
+
+		go runWithPanicLogging(log, "verification scheduler", func() {
+			verification_runs.GetVerificationScheduler().Run(ctx)
 		})
 
 		go runWithPanicLogging(log, "backup cleaner background service", func() {
@@ -453,6 +469,17 @@ func enableCors(ginApp *gin.Engine) {
 			},
 			AllowCredentials: true,
 		}))
+	}
+}
+
+// noStoreCacheControl marks every API response uncacheable. The API serves
+// only dynamic, often sensitive data (backup metadata, tokens, agent binaries,
+// version); a stale cached response — e.g. an outdated /system/version behind
+// a CDN — must never reach a client.
+func noStoreCacheControl() gin.HandlerFunc {
+	return func(ctx *gin.Context) {
+		ctx.Header("Cache-Control", "no-store")
+		ctx.Next()
 	}
 }
 

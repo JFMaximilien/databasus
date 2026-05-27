@@ -1,4 +1,9 @@
-import { type Database, PostgresBackupType, PostgresqlVersion } from '../../../../entity/databases';
+import {
+  type Database,
+  PostgresBackupType,
+  PostgresSslMode,
+  PostgresqlVersion,
+} from '../../../../entity/databases';
 
 interface Props {
   database: Database;
@@ -17,6 +22,13 @@ const postgresqlVersionLabels = {
 const backupTypeLabels: Record<string, string> = {
   [PostgresBackupType.PG_DUMP]: 'Remote (logical)',
   [PostgresBackupType.WAL_V1]: 'Agent (physical)',
+};
+
+const sslModeLabels: Record<string, string> = {
+  [PostgresSslMode.Disable]: 'Disable',
+  [PostgresSslMode.Require]: 'Require',
+  [PostgresSslMode.VerifyCa]: 'Verify CA',
+  [PostgresSslMode.VerifyFull]: 'Verify full',
 };
 
 export const ShowPostgreSqlSpecificDataComponent = ({ database }: Props) => {
@@ -60,9 +72,17 @@ export const ShowPostgreSqlSpecificDataComponent = ({ database }: Props) => {
       </div>
 
       <div className="mb-1 flex w-full items-center">
-        <div className="min-w-[150px]">Use HTTPS</div>
-        <div>{database.postgresql?.isHttps ? 'Yes' : 'No'}</div>
+        <div className="min-w-[150px]">SSL mode</div>
+        <div>{sslModeLabels[database.postgresql?.sslMode ?? PostgresSslMode.Disable]}</div>
       </div>
+
+      {!!database.postgresql?.sslClientCert &&
+        database.postgresql?.sslMode !== PostgresSslMode.Disable && (
+          <div className="mb-1 flex w-full items-center">
+            <div className="min-w-[150px]">Client certificate</div>
+            <div>*************</div>
+          </div>
+        )}
 
       {!!database.postgresql?.includeSchemas?.length && (
         <div className="mb-1 flex w-full items-center">

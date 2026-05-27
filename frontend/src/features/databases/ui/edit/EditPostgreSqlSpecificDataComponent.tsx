@@ -1,9 +1,15 @@
 import { CopyOutlined, DownOutlined, InfoCircleOutlined, UpOutlined } from '@ant-design/icons';
-import { App, Button, Checkbox, Input, InputNumber, Select, Switch, Tooltip } from 'antd';
+import { App, Button, Checkbox, Input, InputNumber, Select, Tooltip } from 'antd';
 import { useEffect, useState } from 'react';
 
 import { IS_CLOUD } from '../../../../constants';
-import { type Database, PostgresBackupType, databaseApi } from '../../../../entity/databases';
+import {
+  type Database,
+  PostgresBackupType,
+  PostgresSslMode,
+  type PostgresqlDatabase,
+  databaseApi,
+} from '../../../../entity/databases';
 import { ConnectionStringParser } from '../../../../entity/databases/model/postgresql/ConnectionStringParser';
 import { ClipboardHelper } from '../../../../shared/lib/ClipboardHelper';
 import { ToastHelper } from '../../../../shared/toast';
@@ -25,6 +31,33 @@ interface Props {
   isShowDbName?: boolean;
   isRestoreMode?: boolean;
 }
+
+const IPV4_PATTERN = /^\d{1,3}(\.\d{1,3}){3}$/;
+
+const deriveSslModeFromHost = (rawHost: string): PostgresSslMode | null => {
+  const trimmed = rawHost.trim().toLowerCase();
+
+  if (trimmed.startsWith('https://')) return PostgresSslMode.Require;
+  if (trimmed.startsWith('http://')) return PostgresSslMode.Disable;
+
+  const bareHost = trimmed.split(':')[0];
+  if (bareHost === 'localhost' || IPV4_PATTERN.test(bareHost)) {
+    return PostgresSslMode.Disable;
+  }
+
+  return null;
+};
+
+const applySslMode = (
+  postgresql: PostgresqlDatabase,
+  sslMode: PostgresSslMode,
+): PostgresqlDatabase => {
+  if (sslMode === PostgresSslMode.Disable) {
+    return { ...postgresql, sslMode, sslClientCert: '', sslClientKey: '', sslRootCert: '' };
+  }
+
+  return { ...postgresql, sslMode };
+};
 
 export const EditPostgreSqlSpecificDataComponent = ({
   database,
@@ -50,14 +83,20 @@ export const EditPostgreSqlSpecificDataComponent = ({
   const [isTestingConnection, setIsTestingConnection] = useState(false);
   const [isConnectionFailed, setIsConnectionFailed] = useState(false);
 
-  const hasAdvancedValues = isRestoreMode
-    ? !!database.postgresql?.isExcludeExtensions ||
-      !!database.postgresql?.isRestoreOwnership ||
-      !!database.postgresql?.isRestorePrivileges
-    : !!database.postgresql?.includeSchemas?.length || !!database.postgresql?.excludeTables?.length;
+  const hasAdvancedValues =
+    !!database.postgresql?.sslClientCert ||
+    !!database.postgresql?.sslRootCert ||
+    (isRestoreMode
+      ? !!database.postgresql?.isExcludeExtensions ||
+        !!database.postgresql?.isRestoreOwnership ||
+        !!database.postgresql?.isRestorePrivileges
+      : !!database.postgresql?.includeSchemas?.length ||
+        !!database.postgresql?.excludeTables?.length);
   const [isShowAdvanced, setShowAdvanced] = useState(hasAdvancedValues);
 
   const [hasAutoAddedPublicSchema, setHasAutoAddedPublicSchema] = useState(false);
+  const [hasUserChosenSslMode, setHasUserChosenSslMode] = useState(!!database.id);
+  const [isReplacingCerts, setIsReplacingCerts] = useState(false);
 
   const [isShowPasteModal, setIsShowPasteModal] = useState(false);
 
@@ -87,11 +126,12 @@ export const EditPostgreSqlSpecificDataComponent = ({
         username: result.username,
         password: result.password,
         database: result.database,
-        isHttps: result.isHttps,
+        sslMode: result.sslMode,
         cpuCount: 1,
       },
     };
 
+    setHasUserChosenSslMode(true);
     setEditingDatabase(autoAddPublicSchemaForSupabase(updatedDatabase));
     setIsConnectionTested(false);
     message.success('Connection string parsed successfully');
@@ -190,11 +230,42 @@ export const EditPostgreSqlSpecificDataComponent = ({
     onSaved(trimmedDatabase);
   };
 
+  const updatePostgresqlCert = (
+    field: 'sslClientCert' | 'sslClientKey' | 'sslRootCert',
+    value: string,
+  ) => {
+    if (!editingDatabase?.postgresql) return;
+
+    setEditingDatabase({
+      ...editingDatabase,
+      postgresql: { ...editingDatabase.postgresql, [field]: value },
+    });
+    setIsConnectionTested(false);
+  };
+
+  const startReplacingCerts = () => {
+    if (!editingDatabase?.postgresql) return;
+
+    setIsReplacingCerts(true);
+    setEditingDatabase({
+      ...editingDatabase,
+      postgresql: {
+        ...editingDatabase.postgresql,
+        sslClientCert: '',
+        sslClientKey: '',
+        sslRootCert: '',
+      },
+    });
+    setIsConnectionTested(false);
+  };
+
   useEffect(() => {
     setIsSaving(false);
     setIsConnectionTested(false);
     setIsTestingConnection(false);
     setIsConnectionFailed(false);
+    setIsReplacingCerts(false);
+    setHasUserChosenSslMode(!!database.id);
 
     setEditingDatabase({ ...database });
   }, [database]);
@@ -253,6 +324,74 @@ export const EditPostgreSqlSpecificDataComponent = ({
     </div>
   );
 
+  const renderSslCertSection = () => {
+    const sslMode = editingDatabase.postgresql?.sslMode ?? PostgresSslMode.Disable;
+    if (sslMode === PostgresSslMode.Disable) return null;
+
+    const hadSslCert = !!database.postgresql?.sslClientCert;
+    if (hadSslCert && !isReplacingCerts) {
+      return (
+        <div className="mb-1 flex w-full items-center">
+          <div className="min-w-[150px]">Client certificate</div>
+          <div className="flex items-center">
+            <span className="mr-3">*************</span>
+            <Button size="small" onClick={startReplacingCerts}>
+              Replace
+            </Button>
+          </div>
+        </div>
+      );
+    }
+
+    return (
+      <>
+        <div className="mb-1 flex w-full items-start">
+          <div className="min-w-[150px]">Client certificate</div>
+          <Input.TextArea
+            value={editingDatabase.postgresql?.sslClientCert || ''}
+            onChange={(e) => updatePostgresqlCert('sslClientCert', e.target.value)}
+            size="small"
+            className="max-w-[300px] grow"
+            placeholder="-----BEGIN CERTIFICATE-----"
+            autoSize={{ minRows: 2, maxRows: 5 }}
+          />
+        </div>
+
+        <div className="mb-1 flex w-full items-start">
+          <div className="min-w-[150px]">Client key</div>
+          <Input.TextArea
+            value={editingDatabase.postgresql?.sslClientKey || ''}
+            onChange={(e) => updatePostgresqlCert('sslClientKey', e.target.value)}
+            size="small"
+            className="max-w-[300px] grow"
+            placeholder="-----BEGIN PRIVATE KEY-----"
+            autoSize={{ minRows: 2, maxRows: 5 }}
+          />
+        </div>
+
+        <div className="mb-1 flex w-full items-start">
+          <div className="flex min-w-[150px] items-center">
+            <span>Server CA certificate</span>
+            <Tooltip
+              className="cursor-pointer"
+              title="Optional. When provided, the server certificate is verified against this CA (verify-ca / verify-full)."
+            >
+              <InfoCircleOutlined className="ml-2" style={{ color: 'gray' }} />
+            </Tooltip>
+          </div>
+          <Input.TextArea
+            value={editingDatabase.postgresql?.sslRootCert || ''}
+            onChange={(e) => updatePostgresqlCert('sslRootCert', e.target.value)}
+            size="small"
+            className="max-w-[300px] grow"
+            placeholder="-----BEGIN CERTIFICATE-----"
+            autoSize={{ minRows: 2, maxRows: 5 }}
+          />
+        </div>
+      </>
+    );
+  };
+
   const renderPgDumpForm = () => {
     let isAllFieldsFilled = true;
     if (!editingDatabase.postgresql?.host) isAllFieldsFilled = false;
@@ -289,12 +428,29 @@ export const EditPostgreSqlSpecificDataComponent = ({
             onChange={(e) => {
               if (!editingDatabase.postgresql) return;
 
+              const rawHost = e.target.value;
+              const basePostgresql = {
+                ...editingDatabase.postgresql,
+                host: rawHost.trim().replace('https://', '').replace('http://', ''),
+              };
+              const isHttpsHost = rawHost.trim().toLowerCase().startsWith('https://');
+              const currentSslMode = basePostgresql.sslMode ?? PostgresSslMode.Disable;
+
+              let derivedSslMode: PostgresSslMode | null = null;
+              if (hasUserChosenSslMode) {
+                if (isHttpsHost && currentSslMode === PostgresSslMode.Disable) {
+                  derivedSslMode = PostgresSslMode.Require;
+                }
+              } else {
+                derivedSslMode = deriveSslModeFromHost(rawHost);
+              }
+
               const updatedDatabase = {
                 ...editingDatabase,
-                postgresql: {
-                  ...editingDatabase.postgresql,
-                  host: e.target.value.trim().replace('https://', '').replace('http://', ''),
-                },
+                postgresql:
+                  derivedSslMode !== null
+                    ? applySslMode(basePostgresql, derivedSslMode)
+                    : basePostgresql,
               };
               setEditingDatabase(autoAddPublicSchemaForSupabase(updatedDatabase));
               setIsConnectionTested(false);
@@ -426,19 +582,27 @@ export const EditPostgreSqlSpecificDataComponent = ({
         )}
 
         <div className="mb-1 flex w-full items-center">
-          <div className="min-w-[150px]">Use HTTPS</div>
-          <Switch
-            checked={editingDatabase.postgresql?.isHttps}
-            onChange={(checked) => {
+          <div className="min-w-[150px]">SSL mode</div>
+          <Select
+            value={editingDatabase.postgresql?.sslMode ?? PostgresSslMode.Disable}
+            onChange={(value: PostgresSslMode) => {
               if (!editingDatabase.postgresql) return;
 
+              setHasUserChosenSslMode(true);
               setEditingDatabase({
                 ...editingDatabase,
-                postgresql: { ...editingDatabase.postgresql, isHttps: checked },
+                postgresql: applySslMode(editingDatabase.postgresql, value),
               });
               setIsConnectionTested(false);
             }}
+            options={[
+              { label: 'Disable', value: PostgresSslMode.Disable },
+              { label: 'Require', value: PostgresSslMode.Require },
+              { label: 'Verify CA', value: PostgresSslMode.VerifyCa },
+              { label: 'Verify full', value: PostgresSslMode.VerifyFull },
+            ]}
             size="small"
+            className="max-w-[200px] grow"
           />
         </div>
 
@@ -624,6 +788,8 @@ export const EditPostgreSqlSpecificDataComponent = ({
                 />
               </div>
             )}
+
+            {renderSslCertSection()}
           </>
         )}
 

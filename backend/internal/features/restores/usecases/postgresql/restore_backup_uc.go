@@ -175,37 +175,18 @@ func (uc *RestorePostgresqlBackupUsecase) restoreViaStdin(
 		}
 	}()
 
-	// Create temporary .pgpass file for authentication
+	// Materialize connection credentials (.pgpass + optional client certificates)
 	fieldEncryptor := util_encryption.GetFieldEncryptor()
 	decryptedPassword, err := fieldEncryptor.Decrypt(pg.Password)
 	if err != nil {
 		return fmt.Errorf("failed to decrypt password: %w", err)
 	}
 
-	pgpassFile, err := uc.createTempPgpassFile(pg, decryptedPassword)
+	credentials, err := pgtypes.WriteCredentialFiles(pg, decryptedPassword, fieldEncryptor)
 	if err != nil {
-		return fmt.Errorf("failed to create temporary .pgpass file: %w", err)
+		return fmt.Errorf("failed to create credential files: %w", err)
 	}
-	defer func() {
-		if pgpassFile != "" {
-			_ = os.RemoveAll(filepath.Dir(pgpassFile))
-		}
-	}()
-
-	// Verify .pgpass file was created successfully
-	if pgpassFile == "" {
-		return fmt.Errorf("temporary .pgpass file was not created")
-	}
-
-	if info, err := os.Stat(pgpassFile); err == nil {
-		uc.logger.Info("Temporary .pgpass file created successfully",
-			"pgpassFile", pgpassFile,
-			"size", info.Size(),
-			"mode", info.Mode(),
-		)
-	} else {
-		return fmt.Errorf("failed to verify .pgpass file: %w", err)
-	}
+	defer credentials.Remove()
 
 	// Get backup stream from storage
 	rawReader, err := storage.GetFile(fieldEncryptor, backup.FileName)
@@ -262,7 +243,7 @@ func (uc *RestorePostgresqlBackupUsecase) restoreViaStdin(
 	uc.logger.Info("Executing PostgreSQL restore command via stdin", "command", cmd.String())
 
 	// Setup environment variables
-	uc.setupPgRestoreEnvironment(cmd, pgpassFile, pg)
+	uc.setupPgRestoreEnvironment(cmd, credentials, pg)
 
 	// Verify executable exists and is accessible
 	if _, err := exec.LookPath(pgBin); err != nil {
@@ -457,31 +438,16 @@ func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
 		}
 	}()
 
-	// Create temporary .pgpass file for authentication
-	pgpassFile, err := uc.createTempPgpassFile(pgConfig, password)
+	// Materialize connection credentials (.pgpass + optional client certificates)
+	credentials, err := pgtypes.WriteCredentialFiles(
+		pgConfig,
+		password,
+		util_encryption.GetFieldEncryptor(),
+	)
 	if err != nil {
-		return fmt.Errorf("failed to create temporary .pgpass file: %w", err)
+		return fmt.Errorf("failed to create credential files: %w", err)
 	}
-	defer func() {
-		if pgpassFile != "" {
-			_ = os.RemoveAll(filepath.Dir(pgpassFile))
-		}
-	}()
-
-	// Verify .pgpass file was created successfully
-	if pgpassFile == "" {
-		return fmt.Errorf("temporary .pgpass file was not created")
-	}
-
-	if info, err := os.Stat(pgpassFile); err == nil {
-		uc.logger.Info("Temporary .pgpass file created successfully",
-			"pgpassFile", pgpassFile,
-			"size", info.Size(),
-			"mode", info.Mode(),
-		)
-	} else {
-		return fmt.Errorf("failed to verify .pgpass file: %w", err)
-	}
+	defer credentials.Remove()
 
 	// Download backup to temporary file
 	tempBackupFile, cleanupFunc, err := uc.downloadBackupToTempFile(ctx, backup, storage)
@@ -496,7 +462,7 @@ func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
 			ctx,
 			pgBin,
 			tempBackupFile,
-			pgpassFile,
+			credentials,
 			pgConfig,
 		)
 		if err != nil {
@@ -513,7 +479,7 @@ func (uc *RestorePostgresqlBackupUsecase) restoreFromStorage(
 	// Add the temporary backup file as the last argument to pg_restore
 	args = append(args, tempBackupFile)
 
-	return uc.executePgRestore(ctx, database, pgBin, args, pgpassFile, pgConfig)
+	return uc.executePgRestore(ctx, database, pgBin, args, credentials, pgConfig)
 }
 
 // downloadBackupToTempFile downloads backup data from storage to a temporary file
@@ -636,14 +602,14 @@ func (uc *RestorePostgresqlBackupUsecase) executePgRestore(
 	database *databases.Database,
 	pgBin string,
 	args []string,
-	pgpassFile string,
+	credentials *pgtypes.CredentialFiles,
 	pgConfig *pgtypes.PostgresqlDatabase,
 ) error {
 	cmd := exec.CommandContext(ctx, pgBin, args...)
 	uc.logger.Info("Executing PostgreSQL restore command", "command", cmd.String())
 
 	// Setup environment variables
-	uc.setupPgRestoreEnvironment(cmd, pgpassFile, pgConfig)
+	uc.setupPgRestoreEnvironment(cmd, credentials, pgConfig)
 
 	// Verify executable exists and is accessible
 	if _, err := exec.LookPath(pgBin); err != nil {
@@ -713,40 +679,37 @@ func (uc *RestorePostgresqlBackupUsecase) executePgRestore(
 // setupPgRestoreEnvironment configures environment variables for pg_restore
 func (uc *RestorePostgresqlBackupUsecase) setupPgRestoreEnvironment(
 	cmd *exec.Cmd,
-	pgpassFile string,
+	credentials *pgtypes.CredentialFiles,
 	pgConfig *pgtypes.PostgresqlDatabase,
 ) {
-	// Start with system environment variables
 	cmd.Env = os.Environ()
 
-	// Use the .pgpass file for authentication
-	cmd.Env = append(cmd.Env, "PGPASSFILE="+pgpassFile)
-	uc.logger.Info("Using temporary .pgpass file for authentication", "pgpassFile", pgpassFile)
+	cmd.Env = append(cmd.Env, "PGPASSFILE="+credentials.PgpassPath)
+	uc.logger.Info(
+		"Using temporary .pgpass file for authentication",
+		"pgpassFile", credentials.PgpassPath,
+	)
 
-	// Add PostgreSQL-specific environment variables
-	cmd.Env = append(cmd.Env, "PGCLIENTENCODING=UTF8")
-	cmd.Env = append(cmd.Env, "PGCONNECT_TIMEOUT=30")
+	cmd.Env = append(cmd.Env,
+		"PGCLIENTENCODING=UTF8",
+		"PGCONNECT_TIMEOUT=30",
+		"LC_ALL=C.UTF-8",
+		"LANG=C.UTF-8",
+	)
 
-	// Add encoding-related environment variables
-	cmd.Env = append(cmd.Env, "LC_ALL=C.UTF-8")
-	cmd.Env = append(cmd.Env, "LANG=C.UTF-8")
-
-	shouldRequireSSL := pgConfig.IsHttps
-
-	// Configure SSL settings
-	if shouldRequireSSL {
-		cmd.Env = append(cmd.Env, "PGSSLMODE=require")
-		uc.logger.Info("Using required SSL mode", "configuredHttps", pgConfig.IsHttps)
-	} else {
-		cmd.Env = append(cmd.Env, "PGSSLMODE=prefer")
-		uc.logger.Info("Using preferred SSL mode", "configuredHttps", pgConfig.IsHttps)
+	sslMode := pgConfig.SslMode
+	if sslMode == "" {
+		sslMode = pgtypes.PostgresSslModeDisable
 	}
 
-	// Set other SSL parameters to avoid certificate issues
-	cmd.Env = append(cmd.Env, "PGSSLCERT=")
-	cmd.Env = append(cmd.Env, "PGSSLKEY=")
-	cmd.Env = append(cmd.Env, "PGSSLROOTCERT=")
-	cmd.Env = append(cmd.Env, "PGSSLCRL=")
+	cmd.Env = append(cmd.Env,
+		"PGSSLMODE="+string(sslMode),
+		"PGSSLCERT="+credentials.ClientCertPath,
+		"PGSSLKEY="+credentials.ClientKeyPath,
+		"PGSSLROOTCERT="+credentials.RootCertPath,
+		"PGSSLCRL=",
+	)
+	uc.logger.Info("Using SSL mode", "sslMode", sslMode)
 }
 
 // handlePgRestoreError processes and formats pg_restore errors
@@ -915,14 +878,14 @@ func (uc *RestorePostgresqlBackupUsecase) generateFilteredTocList(
 	ctx context.Context,
 	pgBin string,
 	backupFile string,
-	pgpassFile string,
+	credentials *pgtypes.CredentialFiles,
 	pgConfig *pgtypes.PostgresqlDatabase,
 ) (string, error) {
 	uc.logger.Info("Generating filtered TOC list to exclude extensions", "backupFile", backupFile)
 
 	// Run pg_restore -l to get the TOC list
 	listCmd := exec.CommandContext(ctx, pgBin, "-l", backupFile)
-	uc.setupPgRestoreEnvironment(listCmd, pgpassFile, pgConfig)
+	uc.setupPgRestoreEnvironment(listCmd, credentials, pgConfig)
 
 	tocOutput, err := listCmd.Output()
 	if err != nil {
@@ -976,46 +939,4 @@ func (uc *RestorePostgresqlBackupUsecase) generateFilteredTocList(
 	)
 
 	return tocFilePath, nil
-}
-
-// createTempPgpassFile creates a temporary .pgpass file with the given password
-func (uc *RestorePostgresqlBackupUsecase) createTempPgpassFile(
-	pgConfig *pgtypes.PostgresqlDatabase,
-	password string,
-) (string, error) {
-	if pgConfig == nil || password == "" {
-		return "", nil
-	}
-
-	escapedHost := tools.EscapePgpassField(pgConfig.Host)
-	escapedUsername := tools.EscapePgpassField(pgConfig.Username)
-	escapedPassword := tools.EscapePgpassField(password)
-
-	pgpassContent := fmt.Sprintf("%s:%d:*:%s:%s",
-		escapedHost,
-		pgConfig.Port,
-		escapedUsername,
-		escapedPassword,
-	)
-
-	// Credential files use OS temp dir (/tmp) because some filesystems
-	// (e.g. ZFS on TrueNAS) ignore chmod, causing "group or world access" errors.
-	tempDir, err := os.MkdirTemp(os.TempDir(), "pgpass_"+uuid.New().String())
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary directory: %w", err)
-	}
-
-	if err := os.Chmod(tempDir, 0o700); err != nil {
-		_ = os.RemoveAll(tempDir)
-		return "", fmt.Errorf("failed to set temporary directory permissions: %w", err)
-	}
-
-	pgpassFile := filepath.Join(tempDir, ".pgpass")
-	err = os.WriteFile(pgpassFile, []byte(pgpassContent), 0o600)
-	if err != nil {
-		_ = os.RemoveAll(tempDir)
-		return "", fmt.Errorf("failed to write temporary .pgpass file: %w", err)
-	}
-
-	return pgpassFile, nil
 }

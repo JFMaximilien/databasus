@@ -464,7 +464,10 @@ func (s *DatabaseService) CopyDatabase(
 				Username:       existingDatabase.Postgresql.Username,
 				Password:       existingDatabase.Postgresql.Password,
 				Database:       existingDatabase.Postgresql.Database,
-				IsHttps:        existingDatabase.Postgresql.IsHttps,
+				SslMode:        existingDatabase.Postgresql.SslMode,
+				SslClientCert:  existingDatabase.Postgresql.SslClientCert,
+				SslClientKey:   existingDatabase.Postgresql.SslClientKey,
+				SslRootCert:    existingDatabase.Postgresql.SslRootCert,
 				IncludeSchemas: existingDatabase.Postgresql.IncludeSchemas,
 				CpuCount:       existingDatabase.Postgresql.CpuCount,
 			}

@@ -125,24 +125,19 @@ func (uc *CreatePostgresqlBackupUsecase) streamToStorage(
 	ctx, cancel := uc.createBackupContext(parentCtx)
 	defer cancel()
 
-	pgpassFile, err := uc.setupPgpassFile(db.Postgresql, password)
+	credentials, err := pgtypes.WriteCredentialFiles(db.Postgresql, password, uc.fieldEncryptor)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create credential files: %w", err)
 	}
-	defer func() {
-		if pgpassFile != "" {
-			// Remove the entire temp directory (which contains the .pgpass file)
-			_ = os.RemoveAll(filepath.Dir(pgpassFile))
-		}
-	}()
+	defer credentials.Remove()
 
 	cmd := exec.CommandContext(ctx, pgBin, args...)
 	uc.logger.Info("Executing PostgreSQL backup command", "command", cmd.String())
 
 	if err := uc.setupPgEnvironment(
 		cmd,
-		pgpassFile,
-		db.Postgresql.IsHttps,
+		credentials,
+		db.Postgresql.SslMode,
 		password,
 		db.Postgresql.CpuCount,
 		pgBin,
@@ -423,49 +418,21 @@ func (uc *CreatePostgresqlBackupUsecase) createBackupContext(
 	return ctx, cancel
 }
 
-func (uc *CreatePostgresqlBackupUsecase) setupPgpassFile(
-	pgConfig *pgtypes.PostgresqlDatabase,
-	password string,
-) (string, error) {
-	pgpassFile, err := uc.createTempPgpassFile(pgConfig, password)
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary .pgpass file: %w", err)
-	}
-
-	if pgpassFile == "" {
-		return "", fmt.Errorf("temporary .pgpass file was not created")
-	}
-
-	if info, err := os.Stat(pgpassFile); err == nil {
-		uc.logger.Info("Temporary .pgpass file created successfully",
-			"pgpassFile", pgpassFile,
-			"size", info.Size(),
-			"mode", info.Mode(),
-		)
-	} else {
-		return "", fmt.Errorf("failed to verify .pgpass file: %w", err)
-	}
-
-	return pgpassFile, nil
-}
-
 func (uc *CreatePostgresqlBackupUsecase) setupPgEnvironment(
 	cmd *exec.Cmd,
-	pgpassFile string,
-	shouldRequireSSL bool,
+	credentials *pgtypes.CredentialFiles,
+	sslMode pgtypes.PostgresSslMode,
 	password string,
 	cpuCount int,
 	pgBin string,
 ) error {
 	cmd.Env = os.Environ()
-	cmd.Env = append(cmd.Env, "PGPASSFILE="+pgpassFile)
+	cmd.Env = append(cmd.Env, "PGPASSFILE="+credentials.PgpassPath)
 
-	uc.logger.Info("Using temporary .pgpass file for authentication", "pgpassFile", pgpassFile)
 	uc.logger.Info("Setting up PostgreSQL environment",
 		"passwordLength", len(password),
 		"passwordEmpty", password == "",
 		"pgBin", pgBin,
-		"usingPgpassFile", true,
 		"parallelJobs", cpuCount,
 	)
 
@@ -476,20 +443,19 @@ func (uc *CreatePostgresqlBackupUsecase) setupPgEnvironment(
 		"LANG=C.UTF-8",
 	)
 
-	if shouldRequireSSL {
-		cmd.Env = append(cmd.Env, "PGSSLMODE=require")
-		uc.logger.Info("Using required SSL mode", "configuredHttps", shouldRequireSSL)
-	} else {
-		cmd.Env = append(cmd.Env, "PGSSLMODE=prefer")
-		uc.logger.Info("Using preferred SSL mode", "configuredHttps", shouldRequireSSL)
+	resolvedSslMode := sslMode
+	if resolvedSslMode == "" {
+		resolvedSslMode = pgtypes.PostgresSslModeDisable
 	}
 
 	cmd.Env = append(cmd.Env,
-		"PGSSLCERT=",
-		"PGSSLKEY=",
-		"PGSSLROOTCERT=",
+		"PGSSLMODE="+string(resolvedSslMode),
+		"PGSSLCERT="+credentials.ClientCertPath,
+		"PGSSLKEY="+credentials.ClientKeyPath,
+		"PGSSLROOTCERT="+credentials.RootCertPath,
 		"PGSSLCRL=",
 	)
+	uc.logger.Info("Using SSL mode", "sslMode", resolvedSslMode)
 
 	if _, err := exec.LookPath(pgBin); err != nil {
 		return fmt.Errorf("PostgreSQL executable not found or not accessible: %s - %w", pgBin, err)
@@ -748,47 +714,6 @@ func (uc *CreatePostgresqlBackupUsecase) handleConnectionErrors(
 	}
 
 	return fmt.Errorf("PostgreSQL connection or authentication error. stderr: %s", stderrStr)
-}
-
-func (uc *CreatePostgresqlBackupUsecase) createTempPgpassFile(
-	pgConfig *pgtypes.PostgresqlDatabase,
-	password string,
-) (string, error) {
-	if pgConfig == nil || password == "" {
-		return "", nil
-	}
-
-	escapedHost := tools.EscapePgpassField(pgConfig.Host)
-	escapedUsername := tools.EscapePgpassField(pgConfig.Username)
-	escapedPassword := tools.EscapePgpassField(password)
-
-	pgpassContent := fmt.Sprintf("%s:%d:*:%s:%s",
-		escapedHost,
-		pgConfig.Port,
-		escapedUsername,
-		escapedPassword,
-	)
-
-	// Credential files use OS temp dir (/tmp) because some filesystems
-	// (e.g. ZFS on TrueNAS) ignore chmod, causing "group or world access" errors.
-	tempDir, err := os.MkdirTemp(os.TempDir(), "pgpass_"+uuid.New().String())
-	if err != nil {
-		return "", fmt.Errorf("failed to create temporary directory: %w", err)
-	}
-
-	if err := os.Chmod(tempDir, 0o700); err != nil {
-		_ = os.RemoveAll(tempDir)
-		return "", fmt.Errorf("failed to set temporary directory permissions: %w", err)
-	}
-
-	pgpassFile := filepath.Join(tempDir, ".pgpass")
-	err = os.WriteFile(pgpassFile, []byte(pgpassContent), 0o600)
-	if err != nil {
-		_ = os.RemoveAll(tempDir)
-		return "", fmt.Errorf("failed to write temporary .pgpass file: %w", err)
-	}
-
-	return pgpassFile, nil
 }
 
 func containsIgnoreCase(str, substr string) bool {

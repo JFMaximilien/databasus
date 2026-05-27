@@ -41,7 +41,12 @@ type PostgresqlDatabase struct {
 	Username string  `json:"username" gorm:"type:text"`
 	Password string  `json:"password" gorm:"type:text"`
 	Database *string `json:"database" gorm:"type:text"`
-	IsHttps  bool    `json:"isHttps"  gorm:"type:boolean;default:false"`
+
+	// SSL / TLS connection settings
+	SslMode       PostgresSslMode `json:"sslMode"       gorm:"column:ssl_mode;type:text;not null;default:'disable'"`
+	SslClientCert string          `json:"sslClientCert" gorm:"column:ssl_client_cert;type:text;not null;default:''"`
+	SslClientKey  string          `json:"sslClientKey"  gorm:"column:ssl_client_key;type:text;not null;default:''"`
+	SslRootCert   string          `json:"sslRootCert"   gorm:"column:ssl_root_cert;type:text;not null;default:''"`
 
 	// backup settings
 	IncludeSchemas       []string `json:"includeSchemas" gorm:"-"`
@@ -97,6 +102,10 @@ func (p *PostgresqlDatabase) Validate() error {
 		p.BackupType = PostgresBackupTypePgDump
 	}
 
+	if p.SslMode == "" {
+		p.SslMode = PostgresSslModeDisable
+	}
+
 	if p.BackupType != PostgresBackupTypePgDump && config.GetEnv().IsCloud {
 		return errors.New("only PG_DUMP backup type is supported in cloud mode")
 	}
@@ -121,6 +130,10 @@ func (p *PostgresqlDatabase) Validate() error {
 
 	if p.CpuCount <= 0 {
 		return errors.New("cpu count must be greater than 0")
+	}
+
+	if err := p.validateSslConfig(); err != nil {
+		return err
 	}
 
 	// Prevent Databasus from backing up itself
@@ -191,14 +204,7 @@ func (p *PostgresqlDatabase) GetRawDbSizeMb(
 		return 0, nil
 	}
 
-	password, err := decryptPasswordIfNeeded(p.Password, encryptor)
-	if err != nil {
-		return 0, fmt.Errorf("failed to decrypt password: %w", err)
-	}
-
-	connStr := buildConnectionStringForDB(p, *p.Database, password)
-
-	conn, err := pgx.Connect(ctx, connStr)
+	conn, err := openPgConn(ctx, p, *p.Database, encryptor)
 	if err != nil {
 		return 0, fmt.Errorf("failed to connect to database '%s': %w", *p.Database, err)
 	}
@@ -222,6 +228,7 @@ func (p *PostgresqlDatabase) HideSensitiveData() {
 	}
 
 	p.Password = ""
+	p.SslClientKey = ""
 }
 
 func (p *PostgresqlDatabase) ValidateUpdate(old *PostgresqlDatabase) error {
@@ -244,7 +251,9 @@ func (p *PostgresqlDatabase) Update(incoming *PostgresqlDatabase) {
 	p.Port = incoming.Port
 	p.Username = incoming.Username
 	p.Database = incoming.Database
-	p.IsHttps = incoming.IsHttps
+	p.SslMode = incoming.SslMode
+	p.SslClientCert = incoming.SslClientCert
+	p.SslRootCert = incoming.SslRootCert
 	p.IncludeSchemas = incoming.IncludeSchemas
 	p.ExcludeTables = incoming.ExcludeTables
 	p.CpuCount = incoming.CpuCount
@@ -252,17 +261,31 @@ func (p *PostgresqlDatabase) Update(incoming *PostgresqlDatabase) {
 	if incoming.Password != "" {
 		p.Password = incoming.Password
 	}
+
+	if incoming.SslClientKey != "" {
+		p.SslClientKey = incoming.SslClientKey
+	}
 }
 
 func (p *PostgresqlDatabase) EncryptSensitiveFields(
 	encryptor encryption.FieldEncryptor,
 ) error {
-	if p.Password != "" {
-		encrypted, err := encryptor.Encrypt(p.Password)
+	for _, field := range []*string{
+		&p.Password,
+		&p.SslClientCert,
+		&p.SslClientKey,
+		&p.SslRootCert,
+	} {
+		if *field == "" {
+			continue
+		}
+
+		encrypted, err := encryptor.Encrypt(*field)
 		if err != nil {
 			return err
 		}
-		p.Password = encrypted
+
+		*field = encrypted
 	}
 
 	return nil
@@ -293,14 +316,7 @@ func (p *PostgresqlDatabase) PopulateVersion(
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	password, err := decryptPasswordIfNeeded(p.Password, encryptor)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt password: %w", err)
-	}
-
-	connStr := buildConnectionStringForDB(p, *p.Database, password)
-
-	conn, err := pgx.Connect(ctx, connStr)
+	conn, err := openPgConn(ctx, p, *p.Database, encryptor)
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -342,14 +358,7 @@ func (p *PostgresqlDatabase) IsUserReadOnly(
 		return false, nil, errors.New("read-only check is not supported for WAL backup type")
 	}
 
-	password, err := decryptPasswordIfNeeded(p.Password, encryptor)
-	if err != nil {
-		return false, nil, fmt.Errorf("failed to decrypt password: %w", err)
-	}
-
-	connStr := buildConnectionStringForDB(p, *p.Database, password)
-
-	conn, err := pgx.Connect(ctx, connStr)
+	conn, err := openPgConn(ctx, p, *p.Database, encryptor)
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -517,14 +526,7 @@ func (p *PostgresqlDatabase) CreateReadOnlyUser(
 		return "", "", errors.New("read-only user creation is not supported for WAL backup type")
 	}
 
-	password, err := decryptPasswordIfNeeded(p.Password, encryptor)
-	if err != nil {
-		return "", "", fmt.Errorf("failed to decrypt password: %w", err)
-	}
-
-	connStr := buildConnectionStringForDB(p, *p.Database, password)
-
-	conn, err := pgx.Connect(ctx, connStr)
+	conn, err := openPgConn(ctx, p, *p.Database, encryptor)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -949,6 +951,30 @@ func (p *PostgresqlDatabase) CreateReadOnlyUser(
 	return "", "", errors.New("failed to generate unique username after 3 attempts")
 }
 
+func (p *PostgresqlDatabase) validateSslConfig() error {
+	switch p.SslMode {
+	case PostgresSslModeDisable, PostgresSslModeRequire, PostgresSslModeVerifyCA, PostgresSslModeVerifyFull:
+	default:
+		return fmt.Errorf("invalid SSL mode: %s", p.SslMode)
+	}
+
+	hasClientCert := p.SslClientCert != ""
+	hasClientKey := p.SslClientKey != ""
+
+	if hasClientCert != hasClientKey {
+		return errors.New("client certificate and client key must be provided together")
+	}
+
+	if p.SslMode == PostgresSslModeDisable &&
+		(hasClientCert || hasClientKey || p.SslRootCert != "") {
+		return errors.New(
+			"SSL certificates require SSL to be enabled (set SSL mode to require, verify-ca or verify-full)",
+		)
+	}
+
+	return nil
+}
+
 // testSingleDatabaseConnection tests connection to a specific database for pg_dump
 func testSingleDatabaseConnection(
 	logger *slog.Logger,
@@ -961,17 +987,8 @@ func testSingleDatabaseConnection(
 		return errors.New("database name is required for single database backup (pg_dump)")
 	}
 
-	// Decrypt password if needed
-	password, err := decryptPasswordIfNeeded(postgresDb.Password, encryptor)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt password: %w", err)
-	}
-
-	// Build connection string for the specific database
-	connStr := buildConnectionStringForDB(postgresDb, *postgresDb.Database, password)
-
 	// Test connection
-	conn, err := pgx.Connect(ctx, connStr)
+	conn, err := openPgConn(ctx, postgresDb, *postgresDb.Database, encryptor)
 	if err != nil {
 		// TODO make more readable errors:
 		// - handle wrong creds
@@ -1160,40 +1177,6 @@ func checkBackupPermissions(
 	}
 
 	return nil
-}
-
-// buildConnectionStringForDB builds connection string for specific database
-func buildConnectionStringForDB(p *PostgresqlDatabase, dbName, password string) string {
-	sslMode := "disable"
-	if p.IsHttps {
-		sslMode = "require"
-	}
-
-	return fmt.Sprintf(
-		"host=%s port=%d user=%s password='%s' dbname=%s sslmode=%s default_query_exec_mode=simple_protocol standard_conforming_strings=on client_encoding=UTF8",
-		p.Host,
-		p.Port,
-		p.Username,
-		escapeConnectionStringValue(password),
-		dbName,
-		sslMode,
-	)
-}
-
-func escapeConnectionStringValue(value string) string {
-	value = strings.ReplaceAll(value, `\`, `\\`)
-	value = strings.ReplaceAll(value, `'`, `\'`)
-	return value
-}
-
-func decryptPasswordIfNeeded(
-	password string,
-	encryptor encryption.FieldEncryptor,
-) (string, error) {
-	if encryptor == nil {
-		return password, nil
-	}
-	return encryptor.Decrypt(password)
 }
 
 func isSupabaseConnection(host, username string) bool {
