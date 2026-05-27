@@ -29,10 +29,10 @@ const (
 	s3TLSHandshakeTimeout = 30 * time.Second
 	s3DeleteTimeout       = 30 * time.Second
 
-	maxParts               = 1000
-	MinPartSize      int64 = 5 * 1024 * 1024          // 5 MB — S3 minimum part size
-	MaxPartSize      int64 = 5 * 1024 * 1024 * 1024   // 5 GB — S3 maximum part size
-	DefaultPartSize  int64 = 32 * 1024 * 1024         // 32 MB — safe default for streaming (unknown size), supports up to ~32 GB
+	maxParts              = 1000
+	MinPartSize     int64 = 5 * 1024 * 1024        // 5 MB — S3 minimum part size
+	MaxPartSize     int64 = 5 * 1024 * 1024 * 1024 // 5 GB — S3 maximum part size
+	DefaultPartSize int64 = 32 * 1024 * 1024       // 32 MB — safe default for streaming (unknown size), supports up to ~32 GB
 )
 
 type S3Storage struct {

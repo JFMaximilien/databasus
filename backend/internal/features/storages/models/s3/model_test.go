@@ -6,10 +6,12 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func Test_CalculatePartSize_WhenFileUnderFiveGB_ReturnsMinPartSize(t *testing.T) {
-	fiveGB := int64(5 * 1024 * 1024 * 1024)
+func Test_CalculatePartSize_WhenFileJustBelowMinThreshold_ReturnsMinPartSize(t *testing.T) {
+	// partSize falls below MinPartSize iff fileSize < MinPartSize * maxParts.
+	// MinPartSize * maxParts = 5 MiB * 1000 ≈ 4.88 GiB, so 4 GiB stays clamped.
+	fourGB := int64(4 * 1024 * 1024 * 1024)
 
-	result := CalculatePartSize(fiveGB)
+	result := CalculatePartSize(fourGB)
 
 	assert.Equal(t, MinPartSize, result)
 }
@@ -39,13 +41,16 @@ func Test_CalculatePartSize_WhenFileEmpty_ReturnsStreamingDefault(t *testing.T) 
 	assert.Equal(t, DefaultPartSize, result)
 }
 
-func Test_CalculatePartSize_WhenFileExactlyFiveGB_ReturnsMinPartSize(t *testing.T) {
+func Test_CalculatePartSize_WhenFileExactlyFiveGB_ScalesAboveMinPartSize(t *testing.T) {
 	exactlyFiveGB := int64(5 * 1024 * 1024 * 1024)
 
 	result := CalculatePartSize(exactlyFiveGB)
 
-	// ceil(5 GB / 1000) = 5.37 MB, which is > MinPartSize (5 MB)
-	assert.Equal(t, MinPartSize, result)
+	// ceil(5 GiB / 1000) ≈ 5.12 MiB, just above MinPartSize (5 MiB),
+	// so the function returns the computed chunk size rather than clamping.
+	assert.Greater(t, result, MinPartSize)
+	assert.LessOrEqual(t, result, MaxPartSize)
+	assert.LessOrEqual(t, (exactlyFiveGB+result-1)/result, int64(maxParts))
 }
 
 func Test_CalculatePartSize_WhenFileSmall_ReturnsMinPartSize(t *testing.T) {
